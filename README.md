@@ -7,6 +7,8 @@
 - WebSocket で JPEG フレームをライブ配信
 - マウス / キーボード / スクロール入力をブラウザへ転送
 - 低遅延化として「古いフレーム破棄」「操作中は高頻度 / 静止中は低頻度」を実装
+- ログを `logs/pymium.log` に保存
+- 一時ディレクトリをプロジェクト内の `.pymium-tmp/` に固定して `/tmp` 制限を回避
 
 ## 起動
 
@@ -26,6 +28,18 @@ python app.py
 - `IDLE_FPS`: 静止時の目標FPS（デフォルト `5`）
 - `ACTIVE_JPEG_QUALITY`: 操作中JPEG品質（デフォルト `80`）
 - `IDLE_JPEG_QUALITY`: 静止時JPEG品質（デフォルト `62`）
+- `PYMIUM_TEMP_DIR`: 一時ディレクトリ
+- `PYMIUM_CACHE_DIR`: キャッシュディレクトリ
+- `PYMIUM_LOG_DIR`: ログディレクトリ
+- `PYMIUM_LOG_LEVEL`: ログレベル
+
+## ログと一時ファイル
+
+- ログファイル: `logs/pymium.log`
+- 一時ディレクトリ: `.pymium-tmp/`
+- キャッシュディレクトリ: `.pymium-cache/`
+
+`/tmp` に容量制限がある環境でも、ダウンロードや展開がプロジェクト内ディレクトリを使うようにしています。
 
 ## 注意
 

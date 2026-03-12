@@ -3,22 +3,125 @@ import base64
 import contextlib
 import importlib
 import json
+import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
+from collections import deque
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
 
 
 BASE_DIR = Path(__file__).resolve().parent
-os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(BASE_DIR / ".playwright-browsers"))
+TEMP_DIR = Path(os.environ.get("PYMIUM_TEMP_DIR", str(BASE_DIR / ".pymium-tmp"))).resolve()
+CACHE_DIR = Path(os.environ.get("PYMIUM_CACHE_DIR", str(BASE_DIR / ".pymium-cache"))).resolve()
+LOG_DIR = Path(os.environ.get("PYMIUM_LOG_DIR", str(BASE_DIR / "logs"))).resolve()
+LOG_FILE = LOG_DIR / "pymium.log"
+PLAYWRIGHT_BROWSERS_DIR = Path(
+    os.environ.get("PLAYWRIGHT_BROWSERS_PATH", str(BASE_DIR / ".playwright-browsers"))
+).resolve()
+
+for directory in (TEMP_DIR, CACHE_DIR, LOG_DIR, PLAYWRIGHT_BROWSERS_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
+
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_BROWSERS_DIR)
+for env_key in ("TMPDIR", "TMP", "TEMP", "TEMPDIR"):
+    os.environ[env_key] = str(TEMP_DIR)
+os.environ.setdefault("PIP_CACHE_DIR", str((CACHE_DIR / "pip").resolve()))
+os.environ.setdefault("XDG_CACHE_HOME", str((CACHE_DIR / "xdg").resolve()))
+Path(os.environ["PIP_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+Path(os.environ["XDG_CACHE_HOME"]).mkdir(parents=True, exist_ok=True)
+tempfile.tempdir = str(TEMP_DIR)
+
+
+def configure_logging() -> logging.Logger:
+    level_name = os.environ.get("PYMIUM_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    existing_names = {handler.get_name() for handler in root_logger.handlers}
+
+    handlers: list[tuple[str, logging.Handler]] = [
+        ("pymium-stream", logging.StreamHandler(sys.stdout)),
+        (
+            "pymium-file",
+            RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8"),
+        ),
+    ]
+
+    for name, handler in handlers:
+        if name in existing_names:
+            continue
+        handler.set_name(name)
+        handler.setLevel(level)
+        handler.setFormatter(formatter)
+        root_logger.addHandler(handler)
+
+    for logger_name in ("hypercorn.error", "hypercorn.access", "quart.app"):
+        named_logger = logging.getLogger(logger_name)
+        named_logger.handlers.clear()
+        named_logger.propagate = True
+        named_logger.setLevel(level)
+
+    logging.captureWarnings(True)
+    logger = logging.getLogger("pymium")
+    logger.setLevel(level)
+    logger.info("Logging to %s", LOG_FILE)
+    logger.info("Temporary directory set to %s", TEMP_DIR)
+    logger.info("Playwright browsers path set to %s", PLAYWRIGHT_BROWSERS_DIR)
+    return logger
+
+
+LOGGER = configure_logging()
 
 RUNTIME_REQUIREMENTS = {
     "quart": "quart>=0.19,<1.0",
     "playwright": "playwright>=1.52,<2.0",
 }
+
+
+def run_logged_subprocess(
+    command: list[str],
+    *,
+    cwd: Optional[Path] = None,
+    env: Optional[dict[str, str]] = None,
+    log_prefix: str = "subprocess",
+) -> str:
+    LOGGER.info("Running %s command: %s", log_prefix, " ".join(command))
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        bufsize=1,
+    )
+
+    tail = deque(maxlen=200)
+    assert process.stdout is not None
+    for line in process.stdout:
+        tail.append(line)
+        stripped = line.rstrip()
+        if stripped:
+            LOGGER.info("[%s] %s", log_prefix, stripped)
+
+    return_code = process.wait()
+    tail_text = "".join(tail)
+    if return_code != 0:
+        raise RuntimeError(
+            f"{log_prefix} command failed with exit code {return_code}: {' '.join(command)}\n\n{tail_text}"
+        )
+
+    return tail_text
 
 
 def ensure_runtime_dependencies() -> None:
@@ -32,8 +135,8 @@ def ensure_runtime_dependencies() -> None:
     if not missing:
         return
 
-    print(f"[bootstrap] Installing missing Python packages: {', '.join(missing)}", flush=True)
-    subprocess.check_call(
+    LOGGER.info("Installing missing Python packages: %s", ", ".join(missing))
+    run_logged_subprocess(
         [
             sys.executable,
             "-m",
@@ -41,7 +144,10 @@ def ensure_runtime_dependencies() -> None:
             "install",
             "--disable-pip-version-check",
             *missing,
-        ]
+        ],
+        cwd=BASE_DIR,
+        env=os.environ.copy(),
+        log_prefix="pip",
     )
     importlib.invalidate_caches()
 
@@ -225,6 +331,9 @@ class BrowserManager:
             "warning": self.warning,
             "install_log": self.install_log[-4000:],
             "browsers_path": os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""),
+            "log_path": str(LOG_FILE),
+            "temp_dir": str(TEMP_DIR),
+            "cache_dir": str(CACHE_DIR),
         }
 
     def touch(self) -> None:
@@ -238,6 +347,7 @@ class BrowserManager:
         self.installing = True
         self.install_log = ""
         self.state = "installing"
+        LOGGER.info("Ensuring Chromium runtime is installed")
 
         cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
         process = await asyncio.create_subprocess_exec(
@@ -254,16 +364,22 @@ class BrowserManager:
             line = await process.stdout.readline()
             if not line:
                 break
-            output.append(line.decode("utf-8", errors="ignore"))
+            decoded = line.decode("utf-8", errors="ignore")
+            output.append(decoded)
             self.install_log = "".join(output)[-12000:]
+            stripped = decoded.rstrip()
+            if stripped:
+                LOGGER.info("[playwright-install] %s", stripped)
 
         return_code = await process.wait()
         self.installing = False
         if return_code != 0:
+            LOGGER.error("Chromium auto download failed with exit code %s", return_code)
             raise RuntimeError(
                 "Chromium の自動ダウンロードに失敗しました。\n"
                 f"command: {' '.join(cmd)}\n\n{self.install_log}"
             )
+        LOGGER.info("Chromium runtime is ready")
 
     async def ensure_started(self) -> None:
         async with self.start_lock:
@@ -320,16 +436,25 @@ class BrowserManager:
                 self.touch()
                 await self._start_capture()
                 self.state = "running"
+                LOGGER.info(
+                    "Chromium started successfully at %s with viewport %sx%s",
+                    self.current_url,
+                    self.viewport_width,
+                    self.viewport_height,
+                )
             except Exception as exc:
                 self.last_error = self._format_exception(exc)
+                LOGGER.exception("Failed to start Chromium session")
                 await self._cleanup(keep_error=True, next_state="error")
 
     async def restart(self) -> None:
+        LOGGER.info("Restarting Chromium session")
         async with self.start_lock:
             await self._cleanup(keep_error=False, next_state="restarting")
         await self.ensure_started()
 
     async def stop(self) -> None:
+        LOGGER.info("Stopping Chromium session")
         async with self.start_lock:
             await self._cleanup(keep_error=True, next_state="stopped")
 
@@ -340,6 +465,7 @@ class BrowserManager:
 
         target = normalize_url(raw_url)
         self.touch()
+        LOGGER.info("Navigating to %s", target)
         await self.page.goto(target, wait_until="domcontentloaded")
         self.current_url = self.page.url
 
@@ -348,6 +474,7 @@ class BrowserManager:
         if self.page is None:
             return
         self.touch()
+        LOGGER.info("Reloading current page")
         await self.page.reload(wait_until="domcontentloaded")
         self.current_url = self.page.url
 
@@ -356,6 +483,7 @@ class BrowserManager:
         if self.page is None:
             return
         self.touch()
+        LOGGER.info("Navigating back")
         response = await self.page.go_back(wait_until="domcontentloaded")
         if response is not None:
             self.current_url = self.page.url
@@ -365,6 +493,7 @@ class BrowserManager:
         if self.page is None:
             return
         self.touch()
+        LOGGER.info("Navigating forward")
         response = await self.page.go_forward(wait_until="domcontentloaded")
         if response is not None:
             self.current_url = self.page.url
@@ -374,6 +503,7 @@ class BrowserManager:
         height = max(240, min(int(height), 4096))
         self.viewport_width = width
         self.viewport_height = height
+        LOGGER.info("Viewport set to %sx%s", width, height)
 
         if self.page is None:
             return
@@ -449,6 +579,7 @@ class BrowserManager:
                 "CDP screencast を開始できなかったため screenshot fallback に切り替えました。\n\n"
                 + self._format_exception(exc)
             )
+            LOGGER.warning("CDP screencast unavailable; switching to screenshot fallback", exc_info=exc)
             self.capture_backend = "screenshot-fallback"
             self.cdp_session = None
 
@@ -514,6 +645,7 @@ class BrowserManager:
             except Exception as exc:
                 self.last_error = self._format_exception(exc)
                 self.state = "error"
+                LOGGER.exception("Screenshot fallback loop failed")
                 break
 
     async def _cleanup(self, keep_error: bool, next_state: str) -> None:
@@ -1075,9 +1207,8 @@ async def ws_endpoint() -> None:
 
 
 if __name__ == "__main__":
-    print(f"[startup] {APP_TITLE} listening on 0.0.0.0:{DEFAULT_PORT}", flush=True)
-    print(
-        f"[startup] PLAYWRIGHT_BROWSERS_PATH={os.environ.get('PLAYWRIGHT_BROWSERS_PATH', '')}",
-        flush=True,
-    )
+    LOGGER.info("%s listening on 0.0.0.0:%s", APP_TITLE, DEFAULT_PORT)
+    LOGGER.info("PLAYWRIGHT_BROWSERS_PATH=%s", os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""))
+    LOGGER.info("Log file=%s", LOG_FILE)
+    LOGGER.info("Temp directory=%s", TEMP_DIR)
     app.run(host="0.0.0.0", port=DEFAULT_PORT)
