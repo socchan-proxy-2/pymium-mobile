@@ -24,11 +24,14 @@ CACHE_DIR = Path(os.environ.get("PYMIUM_CACHE_DIR", str(BASE_DIR / ".pymium-cach
 LOG_DIR = Path(os.environ.get("PYMIUM_LOG_DIR", str(BASE_DIR / "logs"))).resolve()
 LOG_FILE = LOG_DIR / "pymium.log"
 LOCAL_LIBS_DIR = Path(os.environ.get("PYMIUM_LOCAL_LIB_DIR", str(BASE_DIR / ".pymium-system-libs"))).resolve()
+LOCAL_FONTS_DIR = Path(os.environ.get("PYMIUM_LOCAL_FONT_DIR", str(BASE_DIR / ".pymium-fonts"))).resolve()
+FONTCONFIG_DIR = Path(os.environ.get("PYMIUM_FONTCONFIG_DIR", str(CACHE_DIR / "fontconfig"))).resolve()
+FONTCONFIG_FILE = FONTCONFIG_DIR / "fonts.conf"
 PLAYWRIGHT_BROWSERS_DIR = Path(
     os.environ.get("PLAYWRIGHT_BROWSERS_PATH", str(BASE_DIR / ".playwright-browsers"))
 ).resolve()
 
-for directory in (TEMP_DIR, CACHE_DIR, LOG_DIR, LOCAL_LIBS_DIR, PLAYWRIGHT_BROWSERS_DIR):
+for directory in (TEMP_DIR, CACHE_DIR, LOG_DIR, LOCAL_LIBS_DIR, LOCAL_FONTS_DIR, FONTCONFIG_DIR, PLAYWRIGHT_BROWSERS_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_BROWSERS_DIR)
@@ -38,6 +41,8 @@ os.environ.setdefault("PIP_CACHE_DIR", str((CACHE_DIR / "pip").resolve()))
 os.environ.setdefault("XDG_CACHE_HOME", str((CACHE_DIR / "xdg").resolve()))
 Path(os.environ["PIP_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
 Path(os.environ["XDG_CACHE_HOME"]).mkdir(parents=True, exist_ok=True)
+os.environ["FONTCONFIG_PATH"] = str(FONTCONFIG_DIR)
+os.environ["FONTCONFIG_FILE"] = str(FONTCONFIG_FILE)
 tempfile.tempdir = str(TEMP_DIR)
 
 
@@ -124,6 +129,10 @@ ROOTLESS_DEBIAN_COMMON_PACKAGES = [
     "libxrandr2",
     "libxrender1",
     "libxshmfence1",
+]
+
+ROOTLESS_DEBIAN_FONT_PACKAGES = [
+    "fonts-noto-cjk",
 ]
 
 SYSTEM_PACKAGE_MAP = {
@@ -390,6 +399,70 @@ def discover_shared_library_dirs(base_dir: Path) -> list[str]:
     return directories
 
 
+def discover_font_dirs(base_dir: Path) -> list[str]:
+    if not base_dir.exists():
+        return []
+
+    font_extensions = (".ttf", ".otf", ".ttc", ".otc")
+    directories: list[str] = []
+    for root, _, files in os.walk(base_dir):
+        if any(file_name.lower().endswith(font_extensions) for file_name in files):
+            root_path = str(Path(root).resolve())
+            if root_path not in directories:
+                directories.append(root_path)
+    return directories
+
+
+def write_fontconfig_file() -> None:
+    font_dirs = [
+        *discover_font_dirs(LOCAL_FONTS_DIR),
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+    ]
+    unique_dirs: list[str] = []
+    for path in font_dirs:
+        if path and path not in unique_dirs:
+            unique_dirs.append(path)
+
+    dir_xml = "\n".join(f"  <dir>{path}</dir>" for path in unique_dirs)
+    content = f"""<?xml version=\"1.0\"?>
+<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">
+<fontconfig>
+{dir_xml}
+  <cachedir>{(CACHE_DIR / 'fontconfig-cache').resolve()}</cachedir>
+
+  <alias>
+    <family>sans-serif</family>
+    <prefer>
+      <family>Noto Sans CJK JP</family>
+      <family>Noto Sans JP</family>
+      <family>IPAGothic</family>
+    </prefer>
+  </alias>
+
+  <alias>
+    <family>serif</family>
+    <prefer>
+      <family>Noto Serif CJK JP</family>
+      <family>Noto Sans CJK JP</family>
+    </prefer>
+  </alias>
+
+  <alias>
+    <family>monospace</family>
+    <prefer>
+      <family>Noto Sans Mono CJK JP</family>
+      <family>Noto Sans CJK JP</family>
+    </prefer>
+  </alias>
+</fontconfig>
+"""
+    FONTCONFIG_FILE.write_text(content, encoding="utf-8")
+
+
+write_fontconfig_file()
+
+
 def prepend_library_dirs_to_env(directories: list[str]) -> None:
     if not directories:
         return
@@ -411,6 +484,10 @@ def library_exists_in_local_bundle(library_name: str) -> bool:
         if any(file_name.lower() == target for file_name in files):
             return True
     return False
+
+
+def japanese_font_bundle_present() -> bool:
+    return bool(discover_font_dirs(LOCAL_FONTS_DIR))
 
 
 def normalize_url(raw: str) -> str:
@@ -567,6 +644,7 @@ class BrowserManager:
         self.apt_updated = False
         self.blocked_warning_emitted = False
         self.playwright_deps_bootstrap_attempted = False
+        self.font_setup_attempted = False
 
     def status(self) -> dict[str, Any]:
         return {
@@ -586,6 +664,9 @@ class BrowserManager:
             "temp_dir": str(TEMP_DIR),
             "cache_dir": str(CACHE_DIR),
             "local_lib_dir": str(LOCAL_LIBS_DIR),
+            "local_font_dir": str(LOCAL_FONTS_DIR),
+            "fontconfig_file": str(FONTCONFIG_FILE),
+            "japanese_font_bundle_present": japanese_font_bundle_present(),
             "blocked_error": self.blocked_error,
             "missing_shared_library": self.missing_shared_library,
             "system_package_manager": self.system_package_manager,
@@ -696,6 +777,108 @@ class BrowserManager:
 
         prepend_library_dirs_to_env(discover_shared_library_dirs(LOCAL_LIBS_DIR))
         return "\n".join(part for part in collected_output if part)
+
+    async def _install_local_debian_fonts(self, packages: list[str]) -> str:
+        apt_command = shutil.which("apt")
+        dpkg_deb = shutil.which("dpkg-deb")
+        if not apt_command or not dpkg_deb:
+            raise RuntimeError("root不要の日本語フォント展開に必要な apt と dpkg-deb が見つかりません。")
+
+        package_list = list(dict.fromkeys(packages))
+        download_dir = CACHE_DIR / "apt-downloads-fonts"
+        download_dir.mkdir(parents=True, exist_ok=True)
+
+        env = os.environ.copy()
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+
+        collected_output = [
+            await run_logged_async_subprocess(
+                [apt_command, "download", *package_list],
+                cwd=download_dir,
+                env=env,
+                log_prefix="apt-download-fonts",
+            )
+        ]
+
+        for package in package_list:
+            candidates = sorted(download_dir.glob(f"{package}_*.deb"), key=lambda item: item.stat().st_mtime)
+            if not candidates:
+                raise RuntimeError(f"{package} のフォント .deb ファイルを取得できませんでした。")
+
+            deb_file = candidates[-1]
+            collected_output.append(
+                await run_logged_async_subprocess(
+                    [dpkg_deb, "-x", str(deb_file), str(LOCAL_FONTS_DIR)],
+                    env=env,
+                    log_prefix="dpkg-deb-fonts",
+                )
+            )
+
+        write_fontconfig_file()
+        return "\n".join(part for part in collected_output if part)
+
+    async def _refresh_font_cache(self) -> None:
+        write_fontconfig_file()
+        fc_cache = shutil.which("fc-cache")
+        if not fc_cache:
+            LOGGER.info("fc-cache が見つからないため fontconfig 設定ファイルのみ更新しました")
+            return
+
+        font_dirs = discover_font_dirs(LOCAL_FONTS_DIR)
+        command = [fc_cache, "-f"]
+        if font_dirs:
+            command.extend(font_dirs)
+
+        try:
+            await run_logged_async_subprocess(
+                command,
+                env=os.environ.copy(),
+                log_prefix="fc-cache",
+            )
+        except Exception as exc:
+            LOGGER.warning("fc-cache の更新に失敗しました", exc_info=exc)
+
+    async def _ensure_japanese_fonts(self) -> None:
+        if not IS_LINUX:
+            return
+        if self.font_setup_attempted and japanese_font_bundle_present():
+            return
+
+        self.font_setup_attempted = True
+
+        if japanese_font_bundle_present():
+            LOGGER.info("Japanese font bundle already present; refreshing fontconfig cache")
+            await self._refresh_font_cache()
+            return
+
+        try:
+            if self.system_package_manager == "apt-get":
+                if hasattr(os, "geteuid") and os.geteuid() == 0:
+                    LOGGER.info("Installing Japanese fonts via apt-get (%s)", " ".join(ROOTLESS_DEBIAN_FONT_PACKAGES))
+                    output = await self._install_system_packages(ROOTLESS_DEBIAN_FONT_PACKAGES)
+                    self.system_dependency_log = output[-12000:]
+                    self.install_log = self.system_dependency_log
+                else:
+                    LOGGER.info(
+                        "Root 権限なしのため、日本語フォントをローカル展開します (%s)",
+                        " ".join(ROOTLESS_DEBIAN_FONT_PACKAGES),
+                    )
+                    output = await self._install_local_debian_fonts(ROOTLESS_DEBIAN_FONT_PACKAGES)
+                    self.system_dependency_log = output[-12000:]
+                    self.install_log = self.system_dependency_log
+            else:
+                LOGGER.warning("日本語フォントの自動導入は現在 apt 系コンテナにのみ対応しています")
+                return
+
+            await self._refresh_font_cache()
+            if japanese_font_bundle_present():
+                self.warning = "日本語フォントをセットアップしました。"
+                LOGGER.info(self.warning)
+            else:
+                LOGGER.warning("日本語フォントセットアップ後もフォントファイルが確認できませんでした")
+        except Exception as exc:
+            self.warning = f"日本語フォントの自動セットアップに失敗しました: {exc}"
+            LOGGER.exception(self.warning)
 
     async def _maybe_install_playwright_system_dependencies(self) -> None:
         if not IS_LINUX:
@@ -880,6 +1063,7 @@ class BrowserManager:
 
             while True:
                 try:
+                    await self._ensure_japanese_fonts()
                     await self.install_browser_runtime()
                     await self._maybe_install_playwright_system_dependencies()
 
@@ -960,6 +1144,7 @@ class BrowserManager:
         LOGGER.info("Restarting Chromium session")
         self.system_dependency_attempted.clear()
         self.blocked_warning_emitted = False
+        self.font_setup_attempted = False
         async with self.start_lock:
             await self._cleanup(keep_error=False, next_state="restarting")
         await self.ensure_started(force=True)
