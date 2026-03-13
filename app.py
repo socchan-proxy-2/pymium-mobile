@@ -23,11 +23,12 @@ TEMP_DIR = Path(os.environ.get("PYMIUM_TEMP_DIR", str(BASE_DIR / ".pymium-tmp"))
 CACHE_DIR = Path(os.environ.get("PYMIUM_CACHE_DIR", str(BASE_DIR / ".pymium-cache"))).resolve()
 LOG_DIR = Path(os.environ.get("PYMIUM_LOG_DIR", str(BASE_DIR / "logs"))).resolve()
 LOG_FILE = LOG_DIR / "pymium.log"
+LOCAL_LIBS_DIR = Path(os.environ.get("PYMIUM_LOCAL_LIB_DIR", str(BASE_DIR / ".pymium-system-libs"))).resolve()
 PLAYWRIGHT_BROWSERS_DIR = Path(
     os.environ.get("PLAYWRIGHT_BROWSERS_PATH", str(BASE_DIR / ".playwright-browsers"))
 ).resolve()
 
-for directory in (TEMP_DIR, CACHE_DIR, LOG_DIR, PLAYWRIGHT_BROWSERS_DIR):
+for directory in (TEMP_DIR, CACHE_DIR, LOG_DIR, LOCAL_LIBS_DIR, PLAYWRIGHT_BROWSERS_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_BROWSERS_DIR)
@@ -272,10 +273,16 @@ def diagnose_runtime_error(error_text: str) -> tuple[str, Optional[str]]:
         if package_manager and package_candidates
         else "Pymium は Python 側から自動導入を試みられる場合がありますが、対応するパッケージマネージャを判定できませんでした。"
     )
+    rootless_text = (
+        "さらに Debian/Ubuntu 系で apt が使える場合は、root なしでも apt download + dpkg-deb -x でローカル共有ライブラリ展開を試みます。"
+        if package_manager == "apt-get"
+        else ""
+    )
     message = (
         f"Chromium の起動に必要な共有ライブラリが不足しています: {library_name}\n"
         f"{auto_install_text}\n"
         "ただし自動導入には root 権限と OS パッケージマネージャが必要です。\n"
+        f"{rootless_text}\n"
         "例:\n"
         f"{hint_text}\n\n"
         "---- 元のエラー ----\n"
@@ -336,6 +343,43 @@ AUTO_INSTALL_SYSTEM_DEPS = os.environ.get("PYMIUM_AUTO_INSTALL_SYSTEM_DEPS", "1"
     "off",
 }
 IS_LINUX = sys.platform.startswith("linux")
+DEBIAN_PACKAGE_SUITE = os.environ.get("PYMIUM_DEBIAN_SUITE", "bookworm")
+DEBIAN_PACKAGE_ARCH = os.environ.get("PYMIUM_DEBIAN_ARCH", "amd64")
+
+
+def discover_shared_library_dirs(base_dir: Path) -> list[str]:
+    if not base_dir.exists():
+        return []
+
+    directories: list[str] = []
+    for root, _, files in os.walk(base_dir):
+        if any(".so" in file_name for file_name in files):
+            root_path = str(Path(root).resolve())
+            if root_path not in directories:
+                directories.append(root_path)
+    return directories
+
+
+def prepend_library_dirs_to_env(directories: list[str]) -> None:
+    if not directories:
+        return
+
+    existing = [item for item in os.environ.get("LD_LIBRARY_PATH", "").split(":") if item]
+    merged: list[str] = []
+    for path in directories + existing:
+        if path and path not in merged:
+            merged.append(path)
+    os.environ["LD_LIBRARY_PATH"] = ":".join(merged)
+
+
+prepend_library_dirs_to_env(discover_shared_library_dirs(LOCAL_LIBS_DIR))
+
+
+def library_exists_in_local_bundle(library_name: str) -> bool:
+    for root, _, files in os.walk(LOCAL_LIBS_DIR):
+        if library_name in files:
+            return True
+    return False
 
 
 def normalize_url(raw: str) -> str:
@@ -510,6 +554,7 @@ class BrowserManager:
             "log_path": str(LOG_FILE),
             "temp_dir": str(TEMP_DIR),
             "cache_dir": str(CACHE_DIR),
+            "local_lib_dir": str(LOCAL_LIBS_DIR),
             "blocked_error": self.blocked_error,
             "missing_shared_library": self.missing_shared_library,
             "system_package_manager": self.system_package_manager,
@@ -581,6 +626,44 @@ class BrowserManager:
 
         return "\n".join(part for part in collected_output if part)
 
+    async def _install_local_debian_packages(self, packages: list[str]) -> str:
+        apt_command = shutil.which("apt")
+        dpkg_deb = shutil.which("dpkg-deb")
+        if not apt_command or not dpkg_deb:
+            raise RuntimeError("root不要の Debian パッケージ展開に必要な apt と dpkg-deb が見つかりません。")
+
+        download_dir = CACHE_DIR / "apt-downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
+
+        env = os.environ.copy()
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+
+        collected_output = [
+            await run_logged_async_subprocess(
+                [apt_command, "download", *packages],
+                cwd=download_dir,
+                env=env,
+                log_prefix="apt-download",
+            )
+        ]
+
+        for package in packages:
+            candidates = sorted(download_dir.glob(f"{package}_*.deb"), key=lambda item: item.stat().st_mtime)
+            if not candidates:
+                raise RuntimeError(f"{package} の .deb ファイルを取得できませんでした。")
+
+            deb_file = candidates[-1]
+            collected_output.append(
+                await run_logged_async_subprocess(
+                    [dpkg_deb, "-x", str(deb_file), str(LOCAL_LIBS_DIR)],
+                    env=env,
+                    log_prefix="dpkg-deb",
+                )
+            )
+
+        prepend_library_dirs_to_env(discover_shared_library_dirs(LOCAL_LIBS_DIR))
+        return "\n".join(part for part in collected_output if part)
+
     async def _maybe_install_playwright_system_dependencies(self) -> None:
         if not IS_LINUX:
             return
@@ -636,7 +719,35 @@ class BrowserManager:
             LOGGER.warning(message)
             return False, message
 
+        if library_exists_in_local_bundle(library_name):
+            prepend_library_dirs_to_env(discover_shared_library_dirs(LOCAL_LIBS_DIR))
+            message = f"{library_name} は既にローカル共有ライブラリ束に存在するため、それを使って再試行します。"
+            LOGGER.info(message)
+            self.warning = message
+            return True, message
+
         if hasattr(os, "geteuid") and os.geteuid() != 0:
+            if self.system_package_manager == "apt-get":
+                try:
+                    LOGGER.info(
+                        "Root 権限なしのため、Debian パッケージをローカル展開して %s を補います (%s)",
+                        library_name,
+                        " ".join(packages),
+                    )
+                    output = await self._install_local_debian_packages(packages)
+                    self.system_dependency_log = output[-12000:]
+                    self.install_log = self.system_dependency_log
+                    self.warning = (
+                        f"不足していた {library_name} に対して Debian パッケージをローカル展開しました。Chromium を再試行します。"
+                    )
+                    return True, self.warning
+                except Exception as exc:
+                    message = f"root不要のローカル共有ライブラリ展開に失敗しました: {exc}"
+                    self.system_dependency_log = str(exc)[-12000:]
+                    self.install_log = self.system_dependency_log
+                    LOGGER.exception(message)
+                    return False, message
+
             message = "OS パッケージの自動導入には root 権限が必要ですが、現在のプロセスは root ではありません。"
             LOGGER.warning(message)
             return False, message
@@ -764,6 +875,7 @@ class BrowserManager:
                     self.browser = await self.playwright.chromium.launch(
                         headless=True,
                         args=launch_args,
+                        env=os.environ.copy(),
                     )
                     self.context = await self.browser.new_context(
                         viewport={
