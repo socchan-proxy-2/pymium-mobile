@@ -34,6 +34,8 @@ python app.py
 - `PYMIUM_LOG_LEVEL`: ログレベル
 - `PYMIUM_AUTO_INSTALL_SYSTEM_DEPS`: Linux 共有ライブラリ不足時に Python から自動導入を試みるか（デフォルト `1`）
 - `PYMIUM_LOCAL_LIB_DIR`: root不要で展開した共有ライブラリ置き場
+- `PYMIUM_LOCAL_FONT_DIR`: root不要で展開した日本語フォント置き場
+- `PYMIUM_FONTCONFIG_DIR`: fontconfig 設定ディレクトリ
 
 ## ログと一時ファイル
 
@@ -41,6 +43,7 @@ python app.py
 - 一時ディレクトリ: `.pymium-tmp/`
 - キャッシュディレクトリ: `.pymium-cache/`
 - ローカル共有ライブラリ: `.pymium-system-libs/`
+- ローカル日本語フォント: `.pymium-fonts/`
 
 `/tmp` に容量制限がある環境でも、ダウンロードや展開がプロジェクト内ディレクトリを使うようにしています。
 
@@ -51,6 +54,8 @@ Pymium は不足を検出すると、Python 側から `apt-get` / `apk` / `dnf` 
 Debian/Ubuntu 系では追加で `python -m playwright install-deps chromium` 相当も Python 側から自動実行します。
 
 さらに **root 権限が無くても Debian/Ubuntu 系なら**、`apt download` + `dpkg-deb -x` を Python から実行して `.pymium-system-libs/` に共有ライブラリを展開し、`LD_LIBRARY_PATH` で読み込む fallback を試みます。
+
+同様に、日本語が豆腐になる環境向けに `fonts-noto-cjk` を `.pymium-fonts/` へ自動展開し、fontconfig をローカル設定へ切り替える処理も入れています。
 
 - Debian/Ubuntu 系の例: `apt-get update && apt-get install -y libnspr4 libnss3`
 - Alpine 系の例: `apk add --no-cache nspr nss`
