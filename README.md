@@ -1,3 +1,6 @@
+# Pymium for mobile
+このフォークはnazogeさんによる[pymium](https://github.com/nazoge/pymium)をモバイル向けにしたりwebp化したものです。
+以下は本家のREADMEをコピペしただけのものです。
 # Pymium Remote Chromium
 
 `python app.py` だけで起動できる、Pterodactyl 向けの簡易リモートブラウザです。
