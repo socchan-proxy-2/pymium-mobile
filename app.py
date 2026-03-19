@@ -87,6 +87,20 @@ def configure_logging() -> logging.Logger:
 
 
 LOGGER = configure_logging()
+
+# スクリーンショットfallbackの形式 (jpeg / webp / png)
+_sf = os.environ.get("SCREENSHOT_FORMAT", "webp").lower()
+SCREENSHOT_FORMAT: str = _sf if _sf in ("jpeg", "webp", "png") else "webp"
+# CDP screencastフレームをWebPに変換するか (Pillowが必要)
+SCREENCAST_WEBP = os.environ.get("SCREENCAST_WEBP", "0").strip().lower() not in {"0", "false", "no", "off"}
+
+RUNTIME_REQUIREMENTS = {
+    "quart": "quart>=0.19,<1.0",
+    "playwright": "playwright>=1.52,<2.0",
+}
+if SCREENCAST_WEBP:
+    RUNTIME_REQUIREMENTS["PIL"] = "Pillow>=10.0"
+
 MISSING_SHARED_LIBRARY_RE = re.compile(
     r"error while loading shared libraries: ([^:\n]+): cannot open shared object file"
 )
@@ -187,13 +201,6 @@ SYSTEM_PACKAGE_MAP = {
         "libnss3.so": ["nss", "nspr"],
     },
 }
-
-RUNTIME_REQUIREMENTS = {
-    "quart": "quart>=0.19,<1.0",
-    "playwright": "playwright>=1.52,<2.0",
-}
-if SCREENCAST_WEBP:
-    RUNTIME_REQUIREMENTS["PIL"] = "Pillow>=10.0"
 
 
 def run_logged_subprocess(
@@ -377,11 +384,6 @@ ACTIVE_FPS = float(os.environ.get("ACTIVE_FPS", "24"))
 IDLE_FPS = float(os.environ.get("IDLE_FPS", "5"))
 ACTIVE_JPEG_QUALITY = int(os.environ.get("ACTIVE_JPEG_QUALITY", "80"))
 IDLE_JPEG_QUALITY = int(os.environ.get("IDLE_JPEG_QUALITY", "62"))
-# スクリーンショットfallbackの形式 (jpeg / webp / png)
-_sf = os.environ.get("SCREENSHOT_FORMAT", "webp").lower()
-SCREENSHOT_FORMAT: str = _sf if _sf in ("jpeg", "webp", "png") else "webp"
-# CDP screencastフレームをWebPに変換するか (Pillowが必要)
-SCREENCAST_WEBP = os.environ.get("SCREENCAST_WEBP", "0").strip().lower() not in {"0", "false", "no", "off"}
 AUTO_INSTALL_SYSTEM_DEPS = os.environ.get("PYMIUM_AUTO_INSTALL_SYSTEM_DEPS", "1").strip().lower() not in {
     "0",
     "false",
@@ -643,4 +645,1608 @@ class BrowserManager:
         self.last_interaction_at = time.monotonic()
         self.screencast_mode = "idle"
         self.blocked_error = ""
-        self.missing_shared_library: Optional[s
+        self.missing_shared_library: Optional[str] = None
+        self.system_package_manager = detect_package_manager()
+        self.auto_install_system_deps = AUTO_INSTALL_SYSTEM_DEPS
+        self.system_dependency_attempted: set[str] = set()
+        self.system_dependency_log = ""
+        self.apt_updated = False
+        self.blocked_warning_emitted = False
+        self.playwright_deps_bootstrap_attempted = False
+        self.font_setup_attempted = False
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "state": self.state,
+            "capture_backend": self.capture_backend,
+            "installing": self.installing,
+            "current_url": self.current_url,
+            "viewport": {
+                "width": self.viewport_width,
+                "height": self.viewport_height,
+            },
+            "error": self.last_error,
+            "warning": self.warning,
+            "install_log": self.install_log[-4000:],
+            "browsers_path": os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""),
+            "log_path": str(LOG_FILE),
+            "temp_dir": str(TEMP_DIR),
+            "cache_dir": str(CACHE_DIR),
+            "local_lib_dir": str(LOCAL_LIBS_DIR),
+            "local_font_dir": str(LOCAL_FONTS_DIR),
+            "fontconfig_file": str(FONTCONFIG_FILE),
+            "japanese_font_bundle_present": japanese_font_bundle_present(),
+            "blocked_error": self.blocked_error,
+            "missing_shared_library": self.missing_shared_library,
+            "system_package_manager": self.system_package_manager,
+            "auto_install_system_deps": self.auto_install_system_deps,
+            "system_dependency_log": self.system_dependency_log[-4000:],
+        }
+
+    def touch(self) -> None:
+        self.last_interaction_at = time.monotonic()
+
+    def _handle_frame_navigated(self, frame: Any) -> None:
+        if self.page is not None and frame == self.page.main_frame:
+            self.current_url = frame.url
+
+    def _packages_for_library(self, library_name: str) -> list[str]:
+        if not self.system_package_manager:
+            return []
+        return SYSTEM_PACKAGE_MAP.get(self.system_package_manager, {}).get(library_name.lower(), [])
+
+    async def _install_system_packages(self, packages: list[str]) -> str:
+        env = os.environ.copy()
+        manager = self.system_package_manager
+        assert manager is not None
+
+        collected_output: list[str] = []
+        if manager == "apt-get":
+            if not self.apt_updated:
+                collected_output.append(
+                    await run_logged_async_subprocess(
+                        ["apt-get", "update"],
+                        env=env,
+                        log_prefix="apt-update",
+                    )
+                )
+                self.apt_updated = True
+            collected_output.append(
+                await run_logged_async_subprocess(
+                    ["apt-get", "install", "-y", "--no-install-recommends", *packages],
+                    env=env,
+                    log_prefix="apt-install",
+                )
+            )
+        elif manager == "apk":
+            collected_output.append(
+                await run_logged_async_subprocess(
+                    ["apk", "add", "--no-cache", *packages],
+                    env=env,
+                    log_prefix="apk-add",
+                )
+            )
+        elif manager == "dnf":
+            collected_output.append(
+                await run_logged_async_subprocess(
+                    ["dnf", "install", "-y", *packages],
+                    env=env,
+                    log_prefix="dnf-install",
+                )
+            )
+        elif manager == "yum":
+            collected_output.append(
+                await run_logged_async_subprocess(
+                    ["yum", "install", "-y", *packages],
+                    env=env,
+                    log_prefix="yum-install",
+                )
+            )
+        else:
+            raise RuntimeError(f"Unsupported package manager: {manager}")
+
+        return "\n".join(part for part in collected_output if part)
+
+    async def _install_local_debian_packages(self, packages: list[str]) -> str:
+        apt_command = shutil.which("apt")
+        dpkg_deb = shutil.which("dpkg-deb")
+        if not apt_command or not dpkg_deb:
+            raise RuntimeError("root不要の Debian パッケージ展開に必要な apt と dpkg-deb が見つかりません。")
+
+        package_list = list(dict.fromkeys([*packages, *ROOTLESS_DEBIAN_COMMON_PACKAGES]))
+
+        download_dir = CACHE_DIR / "apt-downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
+
+        env = os.environ.copy()
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+
+        collected_output = [
+            await run_logged_async_subprocess(
+                [apt_command, "download", *package_list],
+                cwd=download_dir,
+                env=env,
+                log_prefix="apt-download",
+            )
+        ]
+
+        for package in package_list:
+            candidates = sorted(download_dir.glob(f"{package}_*.deb"), key=lambda item: item.stat().st_mtime)
+            if not candidates:
+                raise RuntimeError(f"{package} の .deb ファイルを取得できませんでした。")
+
+            deb_file = candidates[-1]
+            collected_output.append(
+                await run_logged_async_subprocess(
+                    [dpkg_deb, "-x", str(deb_file), str(LOCAL_LIBS_DIR)],
+                    env=env,
+                    log_prefix="dpkg-deb",
+                )
+            )
+
+        prepend_library_dirs_to_env(discover_shared_library_dirs(LOCAL_LIBS_DIR))
+        return "\n".join(part for part in collected_output if part)
+
+    async def _install_local_debian_fonts(self, packages: list[str]) -> str:
+        apt_command = shutil.which("apt")
+        dpkg_deb = shutil.which("dpkg-deb")
+        if not apt_command or not dpkg_deb:
+            raise RuntimeError("root不要の日本語フォント展開に必要な apt と dpkg-deb が見つかりません。")
+
+        package_list = list(dict.fromkeys(packages))
+        download_dir = CACHE_DIR / "apt-downloads-fonts"
+        download_dir.mkdir(parents=True, exist_ok=True)
+
+        env = os.environ.copy()
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+
+        collected_output = [
+            await run_logged_async_subprocess(
+                [apt_command, "download", *package_list],
+                cwd=download_dir,
+                env=env,
+                log_prefix="apt-download-fonts",
+            )
+        ]
+
+        for package in package_list:
+            candidates = sorted(download_dir.glob(f"{package}_*.deb"), key=lambda item: item.stat().st_mtime)
+            if not candidates:
+                raise RuntimeError(f"{package} のフォント .deb ファイルを取得できませんでした。")
+
+            deb_file = candidates[-1]
+            collected_output.append(
+                await run_logged_async_subprocess(
+                    [dpkg_deb, "-x", str(deb_file), str(LOCAL_FONTS_DIR)],
+                    env=env,
+                    log_prefix="dpkg-deb-fonts",
+                )
+            )
+
+        write_fontconfig_file()
+        return "\n".join(part for part in collected_output if part)
+
+    async def _refresh_font_cache(self) -> None:
+        write_fontconfig_file()
+        fc_cache = shutil.which("fc-cache")
+        if not fc_cache:
+            LOGGER.info("fc-cache が見つからないため fontconfig 設定ファイルのみ更新しました")
+            return
+
+        font_dirs = discover_font_dirs(LOCAL_FONTS_DIR)
+        command = [fc_cache, "-f"]
+        if font_dirs:
+            command.extend(font_dirs)
+
+        try:
+            await run_logged_async_subprocess(
+                command,
+                env=os.environ.copy(),
+                log_prefix="fc-cache",
+            )
+        except Exception as exc:
+            LOGGER.warning("fc-cache の更新に失敗しました", exc_info=exc)
+
+    async def _ensure_japanese_fonts(self) -> None:
+        if not IS_LINUX:
+            return
+        if self.font_setup_attempted and japanese_font_bundle_present():
+            return
+
+        self.font_setup_attempted = True
+
+        if japanese_font_bundle_present():
+            LOGGER.info("Japanese font bundle already present; refreshing fontconfig cache")
+            await self._refresh_font_cache()
+            return
+
+        try:
+            if self.system_package_manager == "apt-get":
+                if hasattr(os, "geteuid") and os.geteuid() == 0:
+                    LOGGER.info("Installing Japanese fonts via apt-get (%s)", " ".join(ROOTLESS_DEBIAN_FONT_PACKAGES))
+                    output = await self._install_system_packages(ROOTLESS_DEBIAN_FONT_PACKAGES)
+                    self.system_dependency_log = output[-12000:]
+                    self.install_log = self.system_dependency_log
+                else:
+                    LOGGER.info(
+                        "Root 権限なしのため、日本語フォントをローカル展開します (%s)",
+                        " ".join(ROOTLESS_DEBIAN_FONT_PACKAGES),
+                    )
+                    output = await self._install_local_debian_fonts(ROOTLESS_DEBIAN_FONT_PACKAGES)
+                    self.system_dependency_log = output[-12000:]
+                    self.install_log = self.system_dependency_log
+            else:
+                LOGGER.warning("日本語フォントの自動導入は現在 apt 系コンテナにのみ対応しています")
+                return
+
+            await self._refresh_font_cache()
+            if japanese_font_bundle_present():
+                self.warning = "日本語フォントをセットアップしました。"
+                LOGGER.info(self.warning)
+            else:
+                LOGGER.warning("日本語フォントセットアップ後もフォントファイルが確認できませんでした")
+        except Exception as exc:
+            self.warning = f"日本語フォントの自動セットアップに失敗しました: {exc}"
+            LOGGER.exception(self.warning)
+
+    async def _maybe_install_playwright_system_dependencies(self) -> None:
+        if not IS_LINUX:
+            return
+        if not self.auto_install_system_deps:
+            return
+        if self.playwright_deps_bootstrap_attempted:
+            return
+        if self.system_package_manager != "apt-get":
+            return
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            LOGGER.warning("Skipping playwright install-deps because root 権限がありません")
+            return
+
+        self.playwright_deps_bootstrap_attempted = True
+        self.installing = True
+        self.state = "installing-system-deps"
+        try:
+            LOGGER.info("Running playwright install-deps chromium")
+            output = await run_logged_async_subprocess(
+                [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+                cwd=BASE_DIR,
+                env=os.environ.copy(),
+                log_prefix="playwright-install-deps",
+            )
+            self.system_dependency_log = output[-12000:]
+            self.install_log = self.system_dependency_log
+        except Exception as exc:
+            self.system_dependency_log = str(exc)[-12000:]
+            self.install_log = self.system_dependency_log
+            LOGGER.warning("playwright install-deps failed; will continue with targeted fallback", exc_info=exc)
+        finally:
+            self.installing = False
+
+    async def _auto_install_system_dependency(self, library_name: str) -> tuple[bool, str]:
+        if not self.auto_install_system_deps:
+            message = "PYMIUM_AUTO_INSTALL_SYSTEM_DEPS=0 のため自動導入は無効です。"
+            LOGGER.warning(message)
+            return False, message
+
+        if library_name in self.system_dependency_attempted:
+            message = f"{library_name} の自動導入は既に試行済みです。"
+            LOGGER.warning(message)
+            return False, message
+
+        if not self.system_package_manager:
+            message = "対応する OS パッケージマネージャを検出できませんでした。"
+            LOGGER.warning(message)
+            return False, message
+
+        packages = self._packages_for_library(library_name)
+        if not packages:
+            message = f"{library_name} に対応する自動導入パッケージが未定義です。"
+            LOGGER.warning(message)
+            return False, message
+
+        if library_exists_in_local_bundle(library_name):
+            prepend_library_dirs_to_env(discover_shared_library_dirs(LOCAL_LIBS_DIR))
+            message = f"{library_name} は既にローカル共有ライブラリ束に存在するため、それを使って再試行します。"
+            LOGGER.info(message)
+            self.warning = message
+            return True, message
+
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            if self.system_package_manager == "apt-get":
+                try:
+                    LOGGER.info(
+                        "Root 権限なしのため、Debian パッケージをローカル展開して %s を補います (%s)",
+                        library_name,
+                        " ".join(packages),
+                    )
+                    output = await self._install_local_debian_packages(packages)
+                    self.system_dependency_log = output[-12000:]
+                    self.install_log = self.system_dependency_log
+                    self.warning = (
+                        f"不足していた {library_name} に対して Debian パッケージをローカル展開しました。Chromium を再試行します。"
+                    )
+                    return True, self.warning
+                except Exception as exc:
+                    message = f"root不要のローカル共有ライブラリ展開に失敗しました: {exc}"
+                    self.system_dependency_log = str(exc)[-12000:]
+                    self.install_log = self.system_dependency_log
+                    LOGGER.exception(message)
+                    return False, message
+
+            message = "OS パッケージの自動導入には root 権限が必要ですが、現在のプロセスは root ではありません。"
+            LOGGER.warning(message)
+            return False, message
+
+        self.system_dependency_attempted.add(library_name)
+        self.installing = True
+        self.state = "installing-system-deps"
+        try:
+            LOGGER.info(
+                "Attempting to auto-install missing shared library %s via %s (%s)",
+                library_name,
+                self.system_package_manager,
+                " ".join(packages),
+            )
+            output = await self._install_system_packages(packages)
+            self.system_dependency_log = output[-12000:]
+            self.install_log = self.system_dependency_log
+            self.warning = (
+                f"不足していた {library_name} に対して OS パッケージを自動導入しました。Chromium を再試行します。"
+            )
+            LOGGER.info("System package install for %s completed", library_name)
+            return True, self.warning
+        except Exception as exc:
+            message = f"{library_name} の自動導入に失敗しました: {exc}"
+            self.system_dependency_log = str(exc)[-12000:]
+            self.install_log = self.system_dependency_log
+            self.warning = message
+            LOGGER.exception(message)
+            return False, message
+        finally:
+            self.installing = False
+
+    async def install_browser_runtime(self) -> None:
+        self.installing = True
+        self.install_log = ""
+        self.state = "installing"
+
+        if playwright_runtime_present():
+            LOGGER.info("Chromium runtime already present; skipping download")
+            self.installing = False
+            return
+
+        LOGGER.info("Ensuring Chromium runtime is installed")
+
+        cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(BASE_DIR),
+            env=os.environ.copy(),
+        )
+
+        output: list[str] = []
+        assert process.stdout is not None
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            decoded = line.decode("utf-8", errors="ignore")
+            output.append(decoded)
+            self.install_log = "".join(output)[-12000:]
+            stripped = decoded.rstrip()
+            if stripped:
+                LOGGER.info("[playwright-install] %s", stripped)
+
+        return_code = await process.wait()
+        self.installing = False
+        if return_code != 0:
+            LOGGER.error("Chromium auto download failed with exit code %s", return_code)
+            raise RuntimeError(
+                "Chromium の自動ダウンロードに失敗しました。\n"
+                f"command: {' '.join(cmd)}\n\n{self.install_log}"
+            )
+        LOGGER.info("Chromium runtime is ready")
+
+    async def ensure_started(self, force: bool = False) -> None:
+        async with self.start_lock:
+            if self.page is not None and self.state in {"running", "installing", "starting"}:
+                return
+
+            if self.blocked_error and not force:
+                if not self.blocked_warning_emitted:
+                    LOGGER.warning("Startup is blocked until container dependencies are fixed")
+                    self.blocked_warning_emitted = True
+                self.state = "error"
+                self.last_error = self.blocked_error
+                return
+
+            await self._cleanup(keep_error=False, next_state="starting")
+            self.warning = ""
+            self.last_error = ""
+            self.blocked_error = ""
+            self.blocked_warning_emitted = False
+            self.missing_shared_library = None
+            self.state = "starting"
+
+            while True:
+                try:
+                    await self._ensure_japanese_fonts()
+                    await self.install_browser_runtime()
+                    await self._maybe_install_playwright_system_dependencies()
+
+                    self.playwright = await async_playwright().start()
+                    launch_args = [
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-background-networking",
+                        "--disable-features=Translate,BackForwardCache",
+                        "--disable-renderer-backgrounding",
+                        "--disable-background-timer-throttling",
+                        "--disable-backgrounding-occluded-windows",
+                        "--autoplay-policy=no-user-gesture-required",
+                        "--no-default-browser-check",
+                        "--no-first-run",
+                        "--hide-scrollbars",
+                        "--mute-audio",
+                        "--password-store=basic",
+                        "--use-mock-keychain",
+                        "--disable-sync",
+                        "--disable-breakpad",
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                    ]
+
+                    self.browser = await self.playwright.chromium.launch(
+                        headless=True,
+                        args=launch_args,
+                        env=os.environ.copy(),
+                    )
+                    self.context = await self.browser.new_context(
+                        viewport={
+                            "width": self.viewport_width,
+                            "height": self.viewport_height,
+                        },
+                        device_scale_factor=1,
+                        ignore_https_errors=True,
+                    )
+                    self.page = await self.context.new_page()
+                    self.page.on("framenavigated", self._handle_frame_navigated)
+                    self.page.set_default_navigation_timeout(45000)
+                    await self.page.goto(self.current_url, wait_until="domcontentloaded")
+                    self.current_url = self.page.url
+                    self.touch()
+                    await self._start_capture()
+                    self.state = "running"
+                    LOGGER.info(
+                        "Chromium started successfully at %s with viewport %sx%s",
+                        self.current_url,
+                        self.viewport_width,
+                        self.viewport_height,
+                    )
+                    return
+                except Exception as exc:
+                    formatted_error = self._format_exception(exc)
+                    diagnosed_error, missing_library = diagnose_runtime_error(formatted_error)
+                    LOGGER.exception("Failed to start Chromium session")
+                    await self._cleanup(keep_error=True, next_state="error")
+
+                    self.last_error = diagnosed_error
+                    self.missing_shared_library = missing_library
+                    if missing_library:
+                        installed, auto_message = await self._auto_install_system_dependency(missing_library)
+                        if installed:
+                            self.last_error = ""
+                            self.blocked_error = ""
+                            self.missing_shared_library = None
+                            self.state = "starting"
+                            continue
+
+                        if auto_message:
+                            self.last_error = f"{diagnosed_error}\n\n---- 自動導入結果 ----\n{auto_message}"
+                        self.blocked_error = self.last_error
+                        self.blocked_warning_emitted = False
+                    return
+
+    async def restart(self) -> None:
+        LOGGER.info("Restarting Chromium session")
+        self.system_dependency_attempted.clear()
+        self.blocked_warning_emitted = False
+        self.font_setup_attempted = False
+        async with self.start_lock:
+            await self._cleanup(keep_error=False, next_state="restarting")
+        await self.ensure_started(force=True)
+
+    async def stop(self) -> None:
+        LOGGER.info("Stopping Chromium session")
+        async with self.start_lock:
+            await self._cleanup(keep_error=True, next_state="stopped")
+
+    async def goto(self, raw_url: str) -> None:
+        await self.ensure_started()
+        if self.page is None:
+            return
+
+        target = normalize_url(raw_url)
+        self.touch()
+        LOGGER.info("Navigating to %s", target)
+        await self.page.goto(target, wait_until="domcontentloaded")
+        self.current_url = self.page.url
+
+    async def reload(self) -> None:
+        await self.ensure_started()
+        if self.page is None:
+            return
+        self.touch()
+        LOGGER.info("Reloading current page")
+        await self.page.reload(wait_until="domcontentloaded")
+        self.current_url = self.page.url
+
+    async def back(self) -> None:
+        await self.ensure_started()
+        if self.page is None:
+            return
+        self.touch()
+        LOGGER.info("Navigating back")
+        response = await self.page.go_back(wait_until="domcontentloaded")
+        if response is not None:
+            self.current_url = self.page.url
+
+    async def forward(self) -> None:
+        await self.ensure_started()
+        if self.page is None:
+            return
+        self.touch()
+        LOGGER.info("Navigating forward")
+        response = await self.page.go_forward(wait_until="domcontentloaded")
+        if response is not None:
+            self.current_url = self.page.url
+
+    async def set_viewport(self, width: int, height: int) -> None:
+        width = max(320, min(int(width), 4096))
+        height = max(240, min(int(height), 4096))
+        self.viewport_width = width
+        self.viewport_height = height
+        LOGGER.info("Viewport set to %sx%s", width, height)
+
+        if self.page is None:
+            return
+
+        await self.page.set_viewport_size({"width": width, "height": height})
+        if self.capture_backend == "cdp-screencast" and self.cdp_session is not None:
+            await self._apply_screencast_profile(force=True)
+
+    async def handle_client_event(self, payload: dict[str, Any]) -> None:
+        event_type = payload.get("type")
+
+        if event_type == "resize":
+            await self.set_viewport(int(payload.get("width", DEFAULT_WIDTH)), int(payload.get("height", DEFAULT_HEIGHT)))
+            return
+
+        if event_type == "goto":
+            await self.goto(str(payload.get("url", "about:blank")))
+            return
+
+        if event_type == "reload":
+            await self.reload()
+            return
+
+        await self.ensure_started()
+        if self.page is None:
+            return
+
+        self.touch()
+
+        if event_type == "mouse_move":
+            await self.page.mouse.move(float(payload.get("x", 0)), float(payload.get("y", 0)))
+        elif event_type == "mouse_down":
+            await self.page.mouse.move(float(payload.get("x", 0)), float(payload.get("y", 0)))
+            await self.page.mouse.down(button=button_name(int(payload.get("button", 0))))
+        elif event_type == "mouse_up":
+            await self.page.mouse.move(float(payload.get("x", 0)), float(payload.get("y", 0)))
+            await self.page.mouse.up(button=button_name(int(payload.get("button", 0))))
+        elif event_type == "mouse_wheel":
+            await self.page.mouse.wheel(float(payload.get("delta_x", 0)), float(payload.get("delta_y", 0)))
+        elif event_type == "keydown":
+            key_name = playwright_key_from_code(payload.get("code"), payload.get("key"))
+            if key_name:
+                await self.page.keyboard.down(key_name)
+        elif event_type == "keyup":
+            key_name = playwright_key_from_code(payload.get("code"), payload.get("key"))
+            if key_name:
+                await self.page.keyboard.up(key_name)
+        elif event_type == "insert_text":
+            text = str(payload.get("text", ""))
+            if text:
+                await self.page.keyboard.insert_text(text)
+
+    async def _start_capture(self) -> None:
+        if self.page is None or self.context is None:
+            return
+
+        self.capture_backend = "starting"
+        self.screencast_mode = "idle"
+
+        try:
+            self.cdp_session = await self.context.new_cdp_session(self.page)
+            self.cdp_session.on(
+                "Page.screencastFrame",
+                lambda params: asyncio.create_task(self._handle_screencast_frame(params)),
+            )
+            await self.cdp_session.send("Page.enable")
+            await self._apply_screencast_profile(force=True)
+            self.capture_backend = "cdp-screencast"
+            self.mode_task = asyncio.create_task(self._screencast_mode_loop())
+            return
+        except Exception as exc:
+            self.warning = (
+                "CDP screencast を開始できなかったため screenshot fallback に切り替えました。\n\n"
+                + self._format_exception(exc)
+            )
+            LOGGER.warning("CDP screencast unavailable; switching to screenshot fallback", exc_info=exc)
+            self.capture_backend = "screenshot-fallback"
+            self.cdp_session = None
+
+        self.capture_task = asyncio.create_task(self._screenshot_loop())
+
+    async def _handle_screencast_frame(self, params: dict[str, Any]) -> None:
+        if self.cdp_session is None:
+            return
+
+        try:
+            data = base64.b64decode(params.get("data", ""))
+            if data:
+                if SCREENCAST_WEBP:
+                    try:
+                        import io
+                        from PIL import Image
+                        quality = ACTIVE_JPEG_QUALITY if self.screencast_mode == "active" else IDLE_JPEG_QUALITY
+                        img = Image.open(io.BytesIO(data))
+                        buf = io.BytesIO()
+                        img.save(buf, format="WEBP", quality=quality, method=4)
+                        data = buf.getvalue()
+                    except Exception:
+                        pass  # 変換失敗時はjpegのまま送信
+                self.frame_hub.publish(data)
+            await self.cdp_session.send(
+                "Page.screencastFrameAck",
+                {"sessionId": params["sessionId"]},
+            )
+        except Exception:
+            pass
+
+    async def _apply_screencast_profile(self, force: bool = False) -> None:
+        if self.cdp_session is None:
+            return
+
+        mode = "active" if (time.monotonic() - self.last_interaction_at) < ACTIVE_WINDOW_SECONDS else "idle"
+        if not force and mode == self.screencast_mode:
+            return
+
+        with contextlib.suppress(Exception):
+            await self.cdp_session.send("Page.stopScreencast")
+
+        quality = ACTIVE_JPEG_QUALITY if mode == "active" else IDLE_JPEG_QUALITY
+        every_n = 1 if mode == "active" else 2
+        await self.cdp_session.send(
+            "Page.startScreencast",
+            {
+                "format": "jpeg",
+                "quality": quality,
+                "everyNthFrame": every_n,
+            },
+        )
+        self.screencast_mode = mode
+
+    async def _screencast_mode_loop(self) -> None:
+        while self.page is not None and self.cdp_session is not None:
+            with contextlib.suppress(Exception):
+                await self._apply_screencast_profile()
+            await asyncio.sleep(0.35)
+
+    async def _screenshot_loop(self) -> None:
+        while self.page is not None:
+            try:
+                active = (time.monotonic() - self.last_interaction_at) < ACTIVE_WINDOW_SECONDS
+                fps = ACTIVE_FPS if active else IDLE_FPS
+                quality = ACTIVE_JPEG_QUALITY if active else IDLE_JPEG_QUALITY
+                started = time.monotonic()
+                frame = await self.page.screenshot(type=SCREENSHOT_FORMAT, quality=quality)
+                self.frame_hub.publish(frame)
+                elapsed = time.monotonic() - started
+                await asyncio.sleep(max(0.0, (1.0 / max(fps, 1.0)) - elapsed))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_error = self._format_exception(exc)
+                self.state = "error"
+                LOGGER.exception("Screenshot fallback loop failed")
+                break
+
+    async def _cleanup(self, keep_error: bool, next_state: str) -> None:
+        if not keep_error:
+            self.last_error = ""
+
+        for task in (self.mode_task, self.capture_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+
+        self.mode_task = None
+        self.capture_task = None
+
+        if self.cdp_session is not None:
+            with contextlib.suppress(Exception):
+                await self.cdp_session.send("Page.stopScreencast")
+        self.cdp_session = None
+
+        if self.context is not None:
+            with contextlib.suppress(Exception):
+                await self.context.close()
+        self.context = None
+        self.page = None
+
+        if self.browser is not None:
+            with contextlib.suppress(Exception):
+                await self.browser.close()
+        self.browser = None
+
+        if self.playwright is not None:
+            with contextlib.suppress(Exception):
+                await self.playwright.stop()
+        self.playwright = None
+
+        self.capture_backend = "none"
+        self.installing = False
+        self.state = next_state
+
+    def _format_exception(self, exc: BaseException) -> str:
+        rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        if isinstance(exc, PlaywrightError):
+            return rendered[-12000:]
+        return rendered[-12000:]
+
+
+manager = BrowserManager()
+app = Quart(__name__)
+
+
+INDEX_HTML = r"""
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>{{ title }}</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1115;
+      --panel: #171a21;
+      --panel-2: #202431;
+      --line: #30384a;
+      --text: #e8edf6;
+      --muted: #9ba8bf;
+      --accent: #4f8cff;
+      --danger: #e56b6f;
+      --ok: #57cc99;
+      --btn-h: 44px;
+      --safe-b: env(safe-area-inset-bottom, 0px);
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      overscroll-behavior: none;
+    }
+    body {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      height: 100dvh;
+      height: 100vh; /* fallback */
+    }
+
+    /* ── ツールバー ── */
+    .toolbar {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      grid-template-rows: auto auto;
+      gap: 6px;
+      padding: 8px 10px;
+      padding-top: max(8px, env(safe-area-inset-top));
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      touch-action: manipulation;
+    }
+    .toolbar-nav {
+      display: flex;
+      gap: 4px;
+      align-items: center;
+      grid-column: 1;
+      grid-row: 1;
+    }
+    .toolbar-url {
+      display: flex;
+      gap: 4px;
+      align-items: center;
+      grid-column: 1 / -1;
+      grid-row: 2;
+    }
+    .toolbar-actions {
+      display: flex;
+      gap: 4px;
+      align-items: center;
+      grid-column: 3;
+      grid-row: 1;
+    }
+
+    button, input {
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 0 12px;
+      height: var(--btn-h);
+      font: inherit;
+      font-size: 15px;
+      min-width: var(--btn-h);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: manipulation;
+    }
+    button { cursor: pointer; }
+    button:active { background: var(--line); }
+    @media (hover: hover) {
+      button:hover { border-color: var(--accent); }
+    }
+    input[type="text"] {
+      flex: 1;
+      min-width: 0;
+      padding: 0 12px;
+      font-size: 14px;
+    }
+    .btn-icon { font-size: 18px; padding: 0; }
+
+    /* メニュードロワー */
+    .menu-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      background: rgba(0,0,0,0.5);
+    }
+    .menu-overlay.open { display: block; }
+    .menu-drawer {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: var(--panel);
+      border-top: 1px solid var(--line);
+      border-radius: 16px 16px 0 0;
+      padding: 12px 16px;
+      padding-bottom: max(16px, var(--safe-b));
+      z-index: 100;
+      transform: translateY(100%);
+      transition: transform 0.25s cubic-bezier(0.32,0.72,0,1);
+    }
+    .menu-overlay.open .menu-drawer { transform: translateY(0); }
+    .menu-handle {
+      width: 36px;
+      height: 4px;
+      border-radius: 2px;
+      background: var(--line);
+      margin: 0 auto 12px;
+    }
+    .menu-item {
+      width: 100%;
+      margin-bottom: 8px;
+      justify-content: flex-start;
+      gap: 10px;
+      font-size: 15px;
+      padding: 0 16px;
+    }
+    .menu-item:last-child { margin-bottom: 0; }
+
+    /* ── スクリーン ── */
+    .screen-wrap {
+      position: relative;
+      overflow: hidden;
+      background: #000;
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      outline: none;
+      cursor: default;
+      touch-action: none;
+    }
+    .overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 24px;
+      background: rgba(10, 12, 16, 0.75);
+      color: var(--text);
+      pointer-events: none;
+      backdrop-filter: blur(4px);
+    }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.45;
+      max-height: 28vh;
+      overflow: auto;
+      background: rgba(0,0,0,0.35);
+      border: 1px solid var(--line);
+      padding: 10px;
+      border-radius: 8px;
+      text-align: left;
+    }
+    .hint { color: var(--muted); font-size: 12px; }
+
+    /* ── ステータスバー ── */
+    .statusbar {
+      display: flex;
+      gap: 8px;
+      padding: 6px 10px;
+      padding-bottom: max(6px, var(--safe-b));
+      border-top: 1px solid var(--line);
+      background: var(--panel);
+      font-size: 12px;
+      color: var(--muted);
+      overflow-x: auto;
+      white-space: nowrap;
+      scrollbar-width: none;
+    }
+    .statusbar::-webkit-scrollbar { display: none; }
+    .pill {
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      flex-shrink: 0;
+    }
+    .ok { color: var(--ok); }
+    .danger { color: var(--danger); }
+
+    /* モバイル専用: ソフトキーボード用の隠しinput */
+    #kbProxy {
+      position: fixed;
+      opacity: 0;
+      pointer-events: none;
+      width: 1px;
+      height: 1px;
+      top: 0;
+      left: 0;
+    }
+
+    /* デスクトップはシンプルなレイアウト維持 */
+    @media (min-width: 640px) {
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        padding: 8px 10px;
+      }
+      .toolbar-nav, .toolbar-actions, .toolbar-url { all: unset; display: contents; }
+      input[type="text"] { flex: 1 1 320px; min-width: 200px; }
+      .btn-menu-toggle { display: none; }
+      .menu-always { display: flex !important; }
+    }
+    @media (max-width: 639px) {
+      .menu-always { display: none !important; }
+      .btn-menu-toggle { display: flex !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <div class="toolbar-nav">
+      <button id="backBtn" class="btn-icon" title="戻る">&#8592;</button>
+      <button id="forwardBtn" class="btn-icon" title="進む">&#8594;</button>
+      <button id="reloadBtn" class="btn-icon" title="更新">&#8635;</button>
+    </div>
+    <div class="toolbar-url">
+      <input id="urlInput" type="text" value="{{ initial_url }}" spellcheck="false" autocomplete="off" inputmode="url">
+      <button id="goBtn">Go</button>
+    </div>
+    <div class="toolbar-actions">
+      <button id="kbBtn" class="btn-icon menu-always" title="キーボード" style="display:none">&#9000;</button>
+      <button id="fsBtn" class="btn-icon menu-always" title="全画面">&#x26F6;</button>
+      <button id="restartBtn" class="menu-always" style="display:none">Restart</button>
+      <button id="menuBtn" class="btn-icon btn-menu-toggle" title="メニュー">&#8942;</button>
+    </div>
+  </div>
+
+  <!-- モバイルメニュードロワー -->
+  <div class="menu-overlay" id="menuOverlay">
+    <div class="menu-drawer">
+      <div class="menu-handle"></div>
+      <button class="menu-item" id="drawerKbBtn">&#9000; ソフトキーボード</button>
+      <button class="menu-item" id="drawerFsBtn">&#x26F6; 全画面</button>
+      <button class="menu-item" id="drawerRestartBtn">&#x21BB; Chromium を再起動</button>
+    </div>
+  </div>
+
+  <!-- ソフトキーボード用プロキシ -->
+  <input id="kbProxy" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+
+  <div id="screenWrap" class="screen-wrap">
+    <canvas id="screen" tabindex="0"></canvas>
+    <div id="overlay" class="overlay">
+      <div>
+        <h2 id="overlayTitle">接続中...</h2>
+        <div class="hint">初回は Playwright の Chromium ダウンロードで少し時間がかかります。</div>
+        <br>
+        <pre id="overlayLog"></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="statusbar">
+    <span class="pill">state: <strong id="stateText">-</strong></span>
+    <span class="pill">backend: <strong id="backendText">-</strong></span>
+    <span class="pill">&#x25A2; <strong id="viewportText">-</strong></span>
+    <span class="pill">ws: <strong id="socketText">connecting</strong></span>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('screen');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    const screenWrap = document.getElementById('screenWrap');
+    const overlay = document.getElementById('overlay');
+    const overlayTitle = document.getElementById('overlayTitle');
+    const overlayLog = document.getElementById('overlayLog');
+    const urlInput = document.getElementById('urlInput');
+    const stateText = document.getElementById('stateText');
+    const backendText = document.getElementById('backendText');
+    const viewportText = document.getElementById('viewportText');
+    const socketText = document.getElementById('socketText');
+    const kbProxy = document.getElementById('kbProxy');
+    const menuOverlay = document.getElementById('menuOverlay');
+
+    let socket;
+    let remoteWidth = 0;
+    let remoteHeight = 0;
+    let pendingFrame = null;
+    let renderBusy = false;
+    let lastResize = { width: 0, height: 0 };
+    let pointerPending = null;
+    let pointerScheduled = false;
+    let latestStatus = null;
+
+    // ─── ユーティリティ ───────────────────────────────────────
+
+    function detectMimeType(buffer) {
+      const b = new Uint8Array(buffer);
+      if (b[0] === 0xFF && b[1] === 0xD8) return 'image/jpeg';
+      if (b[0] === 0x89 && b[1] === 0x50) return 'image/png';
+      // WebP: RIFF????WEBP
+      if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+          b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
+      return 'image/jpeg';
+    }
+
+    function setOverlay(title, log) {
+      overlay.style.display = 'flex';
+      overlayTitle.textContent = title;
+      overlayLog.textContent = log || '';
+    }
+
+    function hideOverlay() {
+      overlay.style.display = 'none';
+    }
+
+    function wsUrl() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      return `${proto}://${location.host}/ws`;
+    }
+
+    function sendWs(payload) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify(payload));
+    }
+
+    function syncViewportToServer() {
+      const rect = screenWrap.getBoundingClientRect();
+      const width = Math.max(320, Math.floor(rect.width));
+      const height = Math.max(240, Math.floor(rect.height));
+      if (width === lastResize.width && height === lastResize.height) return;
+      lastResize = { width, height };
+      sendWs({ type: 'resize', width, height });
+    }
+
+    // ─── ステータス更新 ───────────────────────────────────────
+
+    function updateStatus(status) {
+      latestStatus = status;
+      stateText.textContent = status.state;
+      backendText.textContent = status.capture_backend;
+      viewportText.textContent = `${status.viewport.width}x${status.viewport.height}`;
+      if (document.activeElement !== urlInput && status.current_url) {
+        urlInput.value = status.current_url;
+      }
+
+      if (status.state === 'running') {
+        hideOverlay();
+      } else if (status.state === 'error') {
+        setOverlay('起動エラー', status.error || 'unknown error');
+      } else if (status.installing || status.state === 'installing' || status.state === 'starting') {
+        setOverlay('Chromium を準備中...', status.install_log || 'しばらくお待ちください');
+      } else {
+        setOverlay('待機中', status.error || status.install_log || 'start/restart を試してください');
+      }
+    }
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch('/api/status');
+        updateStatus(await res.json());
+      } catch (error) {
+        setOverlay('status API error', String(error));
+      }
+    }
+
+    // ─── WebSocket ───────────────────────────────────────────
+
+    function connectSocket() {
+      socket = new WebSocket(wsUrl());
+      socket.binaryType = 'arraybuffer';
+
+      socket.addEventListener('open', () => {
+        socketText.textContent = 'open';
+        socketText.className = 'ok';
+        syncViewportToServer();
+      });
+
+      socket.addEventListener('message', (event) => {
+        if (typeof event.data === 'string') {
+          const payload = JSON.parse(event.data);
+          if (payload.type === 'status') updateStatus(payload.status);
+          return;
+        }
+        pendingFrame = event.data;
+        if (!renderBusy) void renderLatestFrame();
+      });
+
+      socket.addEventListener('close', () => {
+        socketText.textContent = 'closed';
+        socketText.className = 'danger';
+        setTimeout(connectSocket, 1000);
+      });
+
+      socket.addEventListener('error', () => {
+        socketText.textContent = 'error';
+        socketText.className = 'danger';
+      });
+    }
+
+    // ─── フレーム描画 ─────────────────────────────────────────
+
+    async function renderLatestFrame() {
+      if (!pendingFrame) return;
+      renderBusy = true;
+
+      while (pendingFrame) {
+        const frame = pendingFrame;
+        pendingFrame = null;
+        const mime = detectMimeType(frame);
+        const bitmap = await createImageBitmap(new Blob([frame], { type: mime }));
+        if (remoteWidth !== bitmap.width || remoteHeight !== bitmap.height) {
+          remoteWidth = bitmap.width;
+          remoteHeight = bitmap.height;
+          canvas.width = remoteWidth;
+          canvas.height = remoteHeight;
+          viewportText.textContent = `${remoteWidth}x${remoteHeight}`;
+        }
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        bitmap.close();
+      }
+
+      renderBusy = false;
+    }
+
+    // ─── 入力変換 ─────────────────────────────────────────────
+
+    function toRemote(clientX, clientY) {
+      const rect = canvas.getBoundingClientRect();
+      if (!remoteWidth || !remoteHeight || !rect.width || !rect.height) {
+        return { x: 0, y: 0 };
+      }
+      return {
+        x: ((clientX - rect.left) / rect.width) * remoteWidth,
+        y: ((clientY - rect.top) / rect.height) * remoteHeight,
+      };
+    }
+
+    function schedulePointerMove(clientX, clientY) {
+      const point = toRemote(clientX, clientY);
+      pointerPending = { type: 'mouse_move', x: point.x, y: point.y };
+      if (pointerScheduled) return;
+      pointerScheduled = true;
+      requestAnimationFrame(() => {
+        pointerScheduled = false;
+        if (pointerPending) { sendWs(pointerPending); pointerPending = null; }
+      });
+    }
+
+    // ─── マウスイベント (デスクトップ) ──────────────────────────
+
+    canvas.addEventListener('pointerdown', (event) => {
+      if (event.pointerType === 'touch') return; // タッチは別処理
+      event.preventDefault();
+      canvas.focus();
+      const point = toRemote(event.clientX, event.clientY);
+      sendWs({ type: 'mouse_down', x: point.x, y: point.y, button: event.button });
+    });
+
+    canvas.addEventListener('pointerup', (event) => {
+      if (event.pointerType === 'touch') return;
+      event.preventDefault();
+      const point = toRemote(event.clientX, event.clientY);
+      sendWs({ type: 'mouse_up', x: point.x, y: point.y, button: event.button });
+    });
+
+    canvas.addEventListener('pointermove', (event) => {
+      if (event.pointerType === 'touch') return;
+      schedulePointerMove(event.clientX, event.clientY);
+    });
+
+    canvas.addEventListener('wheel', (event) => {
+      event.preventDefault();
+      sendWs({ type: 'mouse_wheel', delta_x: event.deltaX, delta_y: event.deltaY });
+    }, { passive: false });
+
+    canvas.addEventListener('contextmenu', (event) => event.preventDefault());
+
+    canvas.addEventListener('keydown', (event) => {
+      event.preventDefault();
+      sendWs({ type: 'keydown', key: event.key, code: event.code });
+    });
+
+    canvas.addEventListener('keyup', (event) => {
+      event.preventDefault();
+      sendWs({ type: 'keyup', key: event.key, code: event.code });
+    });
+
+    window.addEventListener('paste', (event) => {
+      const text = event.clipboardData?.getData('text');
+      if (!text || (document.activeElement !== canvas && document.activeElement !== kbProxy)) return;
+      event.preventDefault();
+      sendWs({ type: 'insert_text', text });
+    });
+
+    // ─── タッチイベント (モバイル) ───────────────────────────────
+
+    let touchStartDist = 0;      // ピンチ開始距離
+    let touchStartScroll = null; // 二本指スクロール開始位置
+    let longPressTimer = null;
+    let touchMoved = false;
+    const LONG_PRESS_MS = 500;
+
+    function getTouchDist(touches) {
+      const dx = touches[0].clientX - touches[1].clientX;
+      const dy = touches[0].clientY - touches[1].clientY;
+      return Math.hypot(dx, dy);
+    }
+
+    function getTouchCenter(touches) {
+      return {
+        x: (touches[0].clientX + touches[1].clientX) / 2,
+        y: (touches[0].clientY + touches[1].clientY) / 2,
+      };
+    }
+
+    canvas.addEventListener('touchstart', (event) => {
+      event.preventDefault();
+      touchMoved = false;
+
+      // フォーカスをキャンバスに固定し、アドレスバー等への吸収を防ぐ
+      if (document.activeElement && document.activeElement !== canvas) {
+        document.activeElement.blur();
+      }
+      canvas.focus({ preventScroll: true });
+
+      if (event.touches.length === 1) {
+        const t = event.touches[0];
+        const point = toRemote(t.clientX, t.clientY);
+        sendWs({ type: 'mouse_move', x: point.x, y: point.y });
+        sendWs({ type: 'mouse_down', x: point.x, y: point.y, button: 0 });
+
+        // 長押し → 右クリック
+        longPressTimer = setTimeout(() => {
+          if (!touchMoved) {
+            sendWs({ type: 'mouse_up', x: point.x, y: point.y, button: 0 });
+            sendWs({ type: 'mouse_down', x: point.x, y: point.y, button: 2 });
+            sendWs({ type: 'mouse_up', x: point.x, y: point.y, button: 2 });
+          }
+        }, LONG_PRESS_MS);
+      } else if (event.touches.length === 2) {
+        if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+        touchStartDist = getTouchDist(event.touches);
+        touchStartScroll = getTouchCenter(event.touches);
+        // タッチ開始時のマウスボタンを解放
+        const t = event.touches[0];
+        const point = toRemote(t.clientX, t.clientY);
+        sendWs({ type: 'mouse_up', x: point.x, y: point.y, button: 0 });
+      }
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', (event) => {
+      event.preventDefault();
+      touchMoved = true;
+
+      if (event.touches.length === 1) {
+        if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+        const t = event.touches[0];
+        schedulePointerMove(t.clientX, t.clientY);
+      } else if (event.touches.length === 2) {
+        const currentDist = getTouchDist(event.touches);
+        const center = getTouchCenter(event.touches);
+
+        // ピンチ → Ctrl+ホイールでズーム
+        const distDelta = currentDist - touchStartDist;
+        if (Math.abs(distDelta) > 2) {
+          const scale = distDelta * 0.5;
+          const point = toRemote(center.x, center.y);
+          sendWs({ type: 'keydown', key: 'Control', code: 'ControlLeft' });
+          sendWs({ type: 'mouse_wheel', delta_x: 0, delta_y: -scale });
+          sendWs({ type: 'keyup', key: 'Control', code: 'ControlLeft' });
+          touchStartDist = currentDist;
+        }
+
+        // 二本指スワイプ → スクロール
+        if (touchStartScroll) {
+          const dx = touchStartScroll.x - center.x;
+          const dy = touchStartScroll.y - center.y;
+          if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
+            sendWs({ type: 'mouse_wheel', delta_x: dx * 1.5, delta_y: dy * 1.5 });
+            touchStartScroll = center;
+          }
+        }
+      }
+    }, { passive: false });
+
+    canvas.addEventListener('touchend', (event) => {
+      event.preventDefault();
+      if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+
+      if (event.changedTouches.length > 0 && !touchMoved) {
+        // タップ完了
+      }
+      if (event.touches.length === 0) {
+        // 全指離れた → マウスアップ
+        const t = event.changedTouches[0];
+        const point = toRemote(t.clientX, t.clientY);
+        sendWs({ type: 'mouse_up', x: point.x, y: point.y, button: 0 });
+      }
+    }, { passive: false });
+
+    // ─── ソフトキーボード (モバイル) ─────────────────────────────
+
+    kbProxy.addEventListener('keydown', (event) => {
+      sendWs({ type: 'keydown', key: event.key, code: event.code });
+    });
+    kbProxy.addEventListener('keyup', (event) => {
+      sendWs({ type: 'keyup', key: event.key, code: event.code });
+    });
+    // compositionend で日本語入力などをまとめて送信
+    kbProxy.addEventListener('compositionend', (event) => {
+      if (event.data) sendWs({ type: 'insert_text', text: event.data });
+      kbProxy.value = '';
+    });
+    kbProxy.addEventListener('input', (event) => {
+      if (event.isComposing) return;
+      const text = kbProxy.value;
+      if (text) { sendWs({ type: 'insert_text', text }); kbProxy.value = ''; }
+    });
+
+    function toggleSoftKeyboard() {
+      if (document.activeElement === kbProxy) {
+        kbProxy.blur();
+      } else {
+        kbProxy.focus();
+      }
+    }
+
+    // ─── ツールバーボタン ─────────────────────────────────────
+
+    async function doGo() {
+      await fetch('/api/goto', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: urlInput.value.trim() })
+      });
+      await refreshStatus();
+    }
+
+    async function doRestart() {
+      closeMenu();
+      setOverlay('Chromium を再起動中...', '');
+      await fetch('/api/restart', { method: 'POST' });
+      await refreshStatus();
+    }
+
+    function doFullscreen() {
+      closeMenu();
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen?.() ?? document.documentElement.webkitRequestFullscreen?.();
+      } else {
+        document.exitFullscreen?.() ?? document.webkitExitFullscreen?.();
+      }
+    }
+
+    function openMenu() { menuOverlay.classList.add('open'); }
+    function closeMenu() { menuOverlay.classList.remove('open'); }
+
+    menuOverlay.addEventListener('click', (e) => { if (e.target === menuOverlay) closeMenu(); });
+
+    document.getElementById('goBtn').addEventListener('click', doGo);
+    urlInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doGo(); } });
+    // タッチ操作中にアドレスバーが誤フォーカスされないようガード
+    urlInput.addEventListener('focus', () => {
+      if (document.activeElement === urlInput) return; // 正常なフォーカス
+    });
+    urlInput.addEventListener('touchstart', (e) => { e.stopPropagation(); });
+    document.getElementById('reloadBtn').addEventListener('click', async () => {
+      await fetch('/api/reload', { method: 'POST' }); await refreshStatus();
+    });
+    document.getElementById('backBtn').addEventListener('click', async () => {
+      await fetch('/api/back', { method: 'POST' }); await refreshStatus();
+    });
+    document.getElementById('forwardBtn').addEventListener('click', async () => {
+      await fetch('/api/forward', { method: 'POST' }); await refreshStatus();
+    });
+    document.getElementById('restartBtn').addEventListener('click', doRestart);
+    document.getElementById('kbBtn').addEventListener('click', toggleSoftKeyboard);
+    document.getElementById('fsBtn').addEventListener('click', doFullscreen);
+    document.getElementById('menuBtn').addEventListener('click', openMenu);
+    document.getElementById('drawerKbBtn').addEventListener('click', () => { closeMenu(); toggleSoftKeyboard(); });
+    document.getElementById('drawerFsBtn').addEventListener('click', doFullscreen);
+    document.getElementById('drawerRestartBtn').addEventListener('click', doRestart);
+
+    // デスクトップはRestartとKbボタンを常時表示
+    if (window.matchMedia('(min-width: 640px)').matches) {
+      document.getElementById('restartBtn').style.display = 'flex';
+      document.getElementById('kbBtn').style.display = 'flex';
+    }
+
+    new ResizeObserver(() => syncViewportToServer()).observe(screenWrap);
+    setInterval(refreshStatus, 2000);
+    connectSocket();
+    void refreshStatus();
+    void fetch('/api/start', { method: 'POST' });
+  </script>
+</body>
+</html>
+"""
+
+
+@app.before_serving
+async def startup() -> None:
+    manager.start_task = asyncio.create_task(manager.ensure_started())
+
+
+@app.after_serving
+async def shutdown() -> None:
+    if manager.start_task is not None:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await manager.start_task
+    await manager.stop()
+
+
+@app.get("/")
+async def index() -> str:
+    return await render_template_string(
+        INDEX_HTML,
+        title=APP_TITLE,
+        initial_url=manager.current_url,
+    )
+
+
+@app.get("/api/status")
+async def api_status():
+    return jsonify(manager.status())
+
+
+@app.post("/api/start")
+async def api_start():
+    if manager.start_task is None or manager.start_task.done():
+        manager.start_task = asyncio.create_task(manager.ensure_started())
+    await asyncio.sleep(0)
+    return jsonify(manager.status())
+
+
+@app.post("/api/restart")
+async def api_restart():
+    await manager.restart()
+    return jsonify(manager.status())
+
+
+@app.post("/api/stop")
+async def api_stop():
+    await manager.stop()
+    return jsonify(manager.status())
+
+
+@app.post("/api/goto")
+async def api_goto():
+    payload = await request.get_json(silent=True) or {}
+    url = str(payload.get("url", "")).strip()
+    if not url:
+        return jsonify({"ok": False, "error": "url is required"}), 400
+    await manager.goto(url)
+    return jsonify({"ok": True, "status": manager.status()})
+
+
+@app.post("/api/reload")
+async def api_reload():
+    await manager.reload()
+    return jsonify({"ok": True, "status": manager.status()})
+
+
+@app.post("/api/back")
+async def api_back():
+    await manager.back()
+    return jsonify({"ok": True, "status": manager.status()})
+
+
+@app.post("/api/forward")
+async def api_forward():
+    await manager.forward()
+    return jsonify({"ok": True, "status": manager.status()})
+
+
+@app.websocket("/ws")
+async def ws_endpoint() -> None:
+    client = manager.frame_hub.register()
+
+    async def sender() -> None:
+        while True:
+            frame = await client.queue.get()
+            await websocket.send(frame)
+
+    send_task = asyncio.create_task(sender())
+    try:
+        await websocket.send(json.dumps({"type": "status", "status": manager.status()}))
+        while True:
+            raw = await websocket.receive()
+            if raw is None:
+                break
+            if isinstance(raw, bytes):
+                continue
+            payload = json.loads(raw)
+            await manager.handle_client_event(payload)
+    except Exception:
+        pass
+    finally:
+        send_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await send_task
+        manager.frame_hub.unregister(client)
+
+
+if __name__ == "__main__":
+    LOGGER.info("%s listening on 0.0.0.0:%s", APP_TITLE, DEFAULT_PORT)
+    LOGGER.info("PLAYWRIGHT_BROWSERS_PATH=%s", os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""))
+    LOGGER.info("Log file=%s", LOG_FILE)
+    LOGGER.info("Temp directory=%s", TEMP_DIR)
+    app.run(host="0.0.0.0", port=DEFAULT_PORT)
